@@ -25,7 +25,6 @@ import (
 	"io"
 	"math"
 	"net"
-	"net/http"
 	"reflect"
 	"runtime"
 	"strings"
@@ -382,7 +381,9 @@ func NewServer(opt ...ServerOption) *Server {
 	for _, o := range opt {
 		o.apply(&opts)
 	}
+
 	s := &Server{
+		//hs:     *http.Server,
 		lis:    make(map[net.Listener]bool),
 		opts:   opts,
 		conns:  make(map[transport.ServerTransport]bool),
@@ -508,12 +509,12 @@ func (s *Server) GetServiceInfo() map[string]ServiceInfo {
 // the server being stopped.
 var ErrServerStopped = errors.New("grpc: the server has been stopped")
 
-func (s *Server) useTransportAuthenticator(rawConn net.Conn) (net.Conn, credentials.AuthInfo, error) {
+/*func (s *Server) useTransportAuthenticator(rawConn net.Conn) (net.Conn, credentials.AuthInfo, error) {
 	if s.opts.creds == nil {
 		return rawConn, nil, nil
 	}
 	return s.opts.creds.ServerHandshake(rawConn)
-}
+}*/
 
 type listenSocket struct {
 	net.Listener
@@ -578,7 +579,62 @@ func (s *Server) Serve(lis net.Listener) error {
 		s.mu.Unlock()
 	}()
 
-	var tempDelay time.Duration // how long to sleep on accept failure
+	config := &transport.ServerConfig{
+		MaxStreams: s.opts.maxConcurrentStreams,
+		//AuthInfo:              authInfo,
+		Creds:                 s.opts.creds,
+		InTapHandle:           s.opts.inTapHandle,
+		StatsHandler:          s.opts.statsHandler,
+		KeepaliveParams:       s.opts.keepaliveParams,
+		KeepalivePolicy:       s.opts.keepalivePolicy,
+		InitialWindowSize:     s.opts.initialWindowSize,
+		InitialConnWindowSize: s.opts.initialConnWindowSize,
+		WriteBufferSize:       s.opts.writeBufferSize,
+		ReadBufferSize:        s.opts.readBufferSize,
+		ChannelzParentID:      s.channelzID,
+		MaxHeaderListSize:     s.opts.maxHeaderListSize,
+		TraceCtx: func(ctx context.Context, method string) context.Context {
+			if !EnableTracing {
+				return ctx
+			}
+			tr := trace.New("grpc.Recv."+methodFamily(method), method)
+			return trace.NewContext(ctx, tr)
+		},
+	}
+
+	streamHandler := func(t transport.ServerTransport, stream *transport.Stream) {
+		s.handleStream(t, stream, s.traceInfo(t, stream))
+	}
+	st, err := transport.NewServerTransport("http2", streamHandler, config)
+	if err != nil {
+		return err
+	}
+	return st.Serve(ls)
+
+	/*st := httpServerTransport(func(w http.ResponseWriter, r *http.Request) error {
+		if r.ProtoMajor != 2 {
+			return errors.New("gRPC requires HTTP/2")
+		}
+		if r.Method != "POST" {
+			return errors.New("invalid gRPC request method")
+		}
+		if _, ok := w.(http.Flusher); !ok {
+			return errors.New("gRPC requires a ResponseWriter supporting http.Flusher")
+		}
+
+		return nil
+	})
+
+	hs := &http.Server{
+		Handler: st,
+	}
+	if err := http2.ConfigureServer(hs, &http2.Server{
+		MaxReadFrameSize: uint32(s.opts.readBufferSize),
+	}); err != nil {
+		return err
+	}*/
+
+	/*var tempDelay time.Duration // how long to sleep on accept failure
 
 	for {
 		rawConn, err := lis.Accept()
@@ -626,10 +682,10 @@ func (s *Server) Serve(lis net.Listener) error {
 			s.handleRawConn(rawConn)
 			s.serveWG.Done()
 		}()
-	}
+	}*/
 }
 
-// handleRawConn forks a goroutine to handle a just-accepted connection that
+/*// handleRawConn forks a goroutine to handle a just-accepted connection that
 // has not had any I/O performed on it yet.
 func (s *Server) handleRawConn(rawConn net.Conn) {
 	if s.quit.HasFired() {
@@ -666,9 +722,9 @@ func (s *Server) handleRawConn(rawConn net.Conn) {
 		s.serveStreams(st)
 		s.removeConn(st)
 	}()
-}
+}*/
 
-// newHTTP2Transport sets up a http/2 transport (using the
+/*// newHTTP2Transport sets up a http/2 transport (using the
 // gRPC http2 server transport in transport/http2_server.go).
 func (s *Server) newHTTP2Transport(c net.Conn, authInfo credentials.AuthInfo) transport.ServerTransport {
 	config := &transport.ServerConfig{
@@ -696,9 +752,9 @@ func (s *Server) newHTTP2Transport(c net.Conn, authInfo credentials.AuthInfo) tr
 	}
 
 	return st
-}
+}*/
 
-func (s *Server) serveStreams(st transport.ServerTransport) {
+/*func (s *Server) serveStreams(st transport.ServerTransport) {
 	defer st.Close()
 	var wg sync.WaitGroup
 	st.HandleStreams(func(stream *transport.Stream) {
@@ -715,9 +771,9 @@ func (s *Server) serveStreams(st transport.ServerTransport) {
 		return trace.NewContext(ctx, tr)
 	})
 	wg.Wait()
-}
+}*/
 
-var _ http.Handler = (*Server)(nil)
+/*var _ http.Handler = (*Server)(nil)
 
 // ServeHTTP implements the Go standard library's http.Handler
 // interface by responding to the gRPC request r, by looking up
@@ -754,11 +810,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.removeConn(st)
 	s.serveStreams(st)
-}
+}*/
 
 // traceInfo returns a traceInfo and associates it with stream, if tracing is enabled.
 // If tracing is not enabled, it returns nil.
 func (s *Server) traceInfo(st transport.ServerTransport, stream *transport.Stream) (trInfo *traceInfo) {
+
 	tr, ok := trace.FromContext(stream.Context())
 	if !ok {
 		return nil
@@ -768,7 +825,7 @@ func (s *Server) traceInfo(st transport.ServerTransport, stream *transport.Strea
 		tr: tr,
 		firstLine: firstLine{
 			client:     false,
-			remoteAddr: st.RemoteAddr(),
+			remoteAddr: stream.RemoteAddr(),
 		},
 	}
 	if dl, ok := stream.Context().Deadline(); ok {
@@ -840,7 +897,7 @@ func (s *Server) sendResponse(t transport.ServerTransport, stream *transport.Str
 	if len(payload) > s.opts.maxSendMessageSize {
 		return status.Errorf(codes.ResourceExhausted, "grpc: trying to send message larger than max (%d vs. %d)", len(payload), s.opts.maxSendMessageSize)
 	}
-	err = t.Write(stream, hdr, payload, opts)
+	err = stream.Write(hdr, payload, opts)
 	if err == nil && s.opts.statsHandler != nil {
 		s.opts.statsHandler.HandleRPC(stream.Context(), outPayload(false, msg, data, payload, time.Now()))
 	}
@@ -927,7 +984,7 @@ func (s *Server) processUnaryRPC(t transport.ServerTransport, stream *transport.
 		decomp = encoding.GetCompressor(rc)
 		if decomp == nil {
 			st := status.Newf(codes.Unimplemented, "grpc: Decompressor is not installed for grpc-encoding %q", rc)
-			t.WriteStatus(stream, st)
+			stream.WriteStatus(st)
 			return st.Err()
 		}
 	}
@@ -954,15 +1011,15 @@ func (s *Server) processUnaryRPC(t transport.ServerTransport, stream *transport.
 	d, err := recvAndDecompress(&parser{r: stream}, stream, dc, s.opts.maxReceiveMessageSize, payInfo, decomp)
 	if err != nil {
 		if st, ok := status.FromError(err); ok {
-			if e := t.WriteStatus(stream, st); e != nil {
+			if e := stream.WriteStatus(st); e != nil {
 				grpclog.Warningf("grpc: Server.processUnaryRPC failed to write status %v", e)
 			}
 		}
 		return err
 	}
-	if channelz.IsOn() {
+	/*if channelz.IsOn() {
 		t.IncrMsgRecv()
-	}
+	}*/
 	df := func(v interface{}) error {
 		if err := s.getCodec(stream.ContentSubtype()).Unmarshal(d, v); err != nil {
 			return status.Errorf(codes.Internal, "grpc: error unmarshalling request: %v", err)
@@ -998,7 +1055,7 @@ func (s *Server) processUnaryRPC(t transport.ServerTransport, stream *transport.
 			trInfo.tr.LazyLog(stringer(appStatus.Message()), true)
 			trInfo.tr.SetError()
 		}
-		if e := t.WriteStatus(stream, appStatus); e != nil {
+		if e := stream.WriteStatus(appStatus); e != nil {
 			grpclog.Warningf("grpc: Server.processUnaryRPC failed to write status: %v", e)
 		}
 		if binlog != nil {
@@ -1027,7 +1084,7 @@ func (s *Server) processUnaryRPC(t transport.ServerTransport, stream *transport.
 			return err
 		}
 		if s, ok := status.FromError(err); ok {
-			if e := t.WriteStatus(stream, s); e != nil {
+			if e := stream.WriteStatus(s); e != nil {
 				grpclog.Warningf("grpc: Server.processUnaryRPC failed to write status: %v", e)
 			}
 		} else {
@@ -1059,16 +1116,16 @@ func (s *Server) processUnaryRPC(t transport.ServerTransport, stream *transport.
 			Message: reply,
 		})
 	}
-	if channelz.IsOn() {
+	/*if channelz.IsOn() {
 		t.IncrMsgSent()
-	}
+	}*/
 	if trInfo != nil {
 		trInfo.tr.LazyLog(&payload{sent: true, msg: reply}, true)
 	}
 	// TODO: Should we be logging if writing status failed here, like above?
 	// Should the logging be in WriteStatus?  Should we ignore the WriteStatus
 	// error or allow the stats handler to see it?
-	err = t.WriteStatus(stream, status.New(codes.OK, ""))
+	err = stream.WriteStatus(status.New(codes.OK, ""))
 	if binlog != nil {
 		binlog.Log(&binarylog.ServerTrailer{
 			Trailer: stream.Trailer(),
@@ -1151,7 +1208,7 @@ func (s *Server) processStreamingRPC(t transport.ServerTransport, stream *transp
 		ss.decomp = encoding.GetCompressor(rc)
 		if ss.decomp == nil {
 			st := status.Newf(codes.Unimplemented, "grpc: Decompressor is not installed for grpc-encoding %q", rc)
-			t.WriteStatus(ss.s, st)
+			ss.s.WriteStatus(st)
 			return st.Err()
 		}
 	}
@@ -1211,7 +1268,7 @@ func (s *Server) processStreamingRPC(t transport.ServerTransport, stream *transp
 			ss.trInfo.tr.SetError()
 			ss.mu.Unlock()
 		}
-		t.WriteStatus(ss.s, appStatus)
+		ss.s.WriteStatus(appStatus)
 		if ss.binlog != nil {
 			ss.binlog.Log(&binarylog.ServerTrailer{
 				Trailer: ss.s.Trailer(),
@@ -1226,7 +1283,7 @@ func (s *Server) processStreamingRPC(t transport.ServerTransport, stream *transp
 		ss.trInfo.tr.LazyLog(stringer("OK"), false)
 		ss.mu.Unlock()
 	}
-	err = t.WriteStatus(ss.s, status.New(codes.OK, ""))
+	err = ss.s.WriteStatus(status.New(codes.OK, ""))
 	if ss.binlog != nil {
 		ss.binlog.Log(&binarylog.ServerTrailer{
 			Trailer: ss.s.Trailer(),
@@ -1248,7 +1305,7 @@ func (s *Server) handleStream(t transport.ServerTransport, stream *transport.Str
 			trInfo.tr.SetError()
 		}
 		errDesc := fmt.Sprintf("malformed method name: %q", stream.Method())
-		if err := t.WriteStatus(stream, status.New(codes.ResourceExhausted, errDesc)); err != nil {
+		if err := stream.WriteStatus(status.New(codes.ResourceExhausted, errDesc)); err != nil {
 			if trInfo != nil {
 				trInfo.tr.LazyLog(&fmtStringer{"%v", []interface{}{err}}, true)
 				trInfo.tr.SetError()
@@ -1289,7 +1346,7 @@ func (s *Server) handleStream(t transport.ServerTransport, stream *transport.Str
 		trInfo.tr.LazyPrintf("%s", errDesc)
 		trInfo.tr.SetError()
 	}
-	if err := t.WriteStatus(stream, status.New(codes.Unimplemented, errDesc)); err != nil {
+	if err := stream.WriteStatus(status.New(codes.Unimplemented, errDesc)); err != nil {
 		if trInfo != nil {
 			trInfo.tr.LazyLog(&fmtStringer{"%v", []interface{}{err}}, true)
 			trInfo.tr.SetError()

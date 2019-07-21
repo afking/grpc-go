@@ -30,9 +30,11 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/internal/channelz"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/stats"
@@ -218,8 +220,10 @@ const (
 
 // Stream represents an RPC in the transport layer.
 type Stream struct {
-	id           uint32
-	st           ServerTransport    // nil for client side Stream
+	id uint32
+	st ServerTransport // nil for client side Stream
+	ct ClientTransport // nil for server side Stream
+
 	ctx          context.Context    // the associated context of the stream
 	cancel       context.CancelFunc // always nil for client side Stream
 	done         chan struct{}      // closed at the end of stream to unblock writers. On the client side.
@@ -227,14 +231,15 @@ type Stream struct {
 	method       string             // the associated RPC method of the stream
 	recvCompress string
 	sendCompress string
+	/* TODO  Fix up
 	buf          *recvBuffer
 	trReader     io.Reader
 	fc           *inFlow
-	wq           *writeQuota
+	wq           *writeQuota*/
 
 	// Callback to state application's intentions to read data. This
 	// is used to adjust flow control, if needed.
-	requestRead func(int)
+	//requestRead func(int)
 
 	headerChan       chan struct{} // closed to indicate the end of header metadata.
 	headerChanClosed uint32        // set when headerChan is closed. Used to avoid closing headerChan multiple times.
@@ -265,6 +270,16 @@ type Stream struct {
 	// contentSubtype is the content-subtype for requests.
 	// this must be lowercase or the behavior is undefined.
 	contentSubtype string
+	remoteAddr     string
+
+	czData      *channelzData
+	writeHeader func(md metadata.MD) error
+	write       func(hdr, data []byte, opts *Options) error
+	writeStatus func(st *status.Status) error
+
+	read  func([]byte) (int, error)
+	close func() error
+	//readErr error // io.EOF
 }
 
 // isHeaderSent is only valid on the server-side.
@@ -418,7 +433,8 @@ func (s *Stream) SetHeader(md metadata.MD) error {
 // combined with any metadata set by previous calls to SetHeader and
 // then written to the transport stream.
 func (s *Stream) SendHeader(md metadata.MD) error {
-	return s.st.WriteHeader(s, md)
+	//return s.st.WriteHeader(s, md)
+	return s.writeHeader(md)
 }
 
 // SetTrailer sets the trailer metadata which will be sent with the RPC status
@@ -437,20 +453,34 @@ func (s *Stream) SetTrailer(md metadata.MD) error {
 	return nil
 }
 
-func (s *Stream) write(m recvMsg) {
+/*func (s *Stream) write(m recvMsg) {
+	s.buf.put(m)
+}*/
+func (s *Stream) put(m recvMsg) {
 	s.buf.put(m)
 }
 
 // Read reads all p bytes from the wire for this stream.
 func (s *Stream) Read(p []byte) (n int, err error) {
-	// Don't request a read if there was an error earlier
-	if er := s.trReader.(*transportReader).er; er != nil {
-		return 0, er
-	}
-	s.requestRead(len(p))
-	return io.ReadFull(s.trReader, p)
+	return io.ReadFull(s.read, p)
+
+	/*
+		// Don't request a read if there was an error earlier
+		if er := s.trReader.(*transportReader).er; er != nil {
+			return 0, er
+		}
+		s.requestRead(len(p))
+		return io.ReadFull(s.trReader, p)*/
 }
 
+func (s *Stream) Close() error {
+	if s.close != nil {
+		return s.close.Close()
+	}
+	return nil
+}
+
+/*
 // tranportReader reads all the data available for this Stream from the transport and
 // passes them into the decoder, which converts them into a gRPC message stream.
 // The error is io.EOF when the stream is done or another non-nil error if
@@ -471,7 +501,7 @@ func (t *transportReader) Read(p []byte) (n int, err error) {
 	}
 	t.windowHandler(n)
 	return
-}
+}*/
 
 // BytesReceived indicates whether any bytes have been received on this stream.
 func (s *Stream) BytesReceived() bool {
@@ -490,6 +520,71 @@ func (s *Stream) GoString() string {
 	return fmt.Sprintf("<stream: %p, %v>", s, s.method)
 }
 
+func (s *Stream) incrMsgSent() {
+	atomic.AddInt64(&s.czData.msgSent, 1)
+	atomic.StoreInt64(&s.czData.lastMsgSentTime, time.Now().UnixNano())
+}
+
+func (s *Stream) incrMsgRecv() {
+	atomic.AddInt64(&s.czData.msgRecv, 1)
+	atomic.StoreInt64(&s.czData.lastMsgRecvTime, time.Now().UnixNano())
+}
+
+// Alias for SendHeader... TODO
+func (s *Stream) WriteHeader(md metadata.MD) error {
+	return s.writeHeader(md)
+}
+
+func (s *Stream) Write(hdr, data []byte, opts *Options) error {
+	if opts.Last {
+		// If it's the last message, update stream state.
+		if !s.compareAndSwapState(streamActive, streamWriteDone) {
+			return errStreamDone
+		}
+	} else if s.getState() != streamActive {
+		return errStreamDone
+	}
+
+	if _, err := s.write(hdf, data, opts); err != nil {
+		return err
+	}
+
+	if channelz.IsOn() {
+		s.incrMsgSent()
+	}
+	return nil
+}
+
+func (s *Stream) WriteStatus(st *status.Status) error {
+	return s.writeStatus(st)
+}
+
+// strAddr is a net.Addr backed by either a TCP "ip:port" string, or
+// the empty string if unknown.
+type strAddr string
+
+func (a strAddr) Network() string {
+	if a != "" {
+		// Per the documentation on net/http.Request.RemoteAddr, if this is
+		// set, it's set to the IP:port of the peer (hence, TCP):
+		// https://golang.org/pkg/net/http/#Request
+		//
+		// If we want to support Unix sockets later, we can
+		// add our own grpc-specific convention within the
+		// grpc codebase to set RemoteAddr to a different
+		// format, or probably better: we can attach it to the
+		// context and use that from serverHandlerTransport.RemoteAddr.
+		return "tcp"
+	}
+	return ""
+}
+
+func (a strAddr) String() string { return string(a) }
+
+func (s *Stream) RemoteAddr() net.Addr {
+	return strAddr(s.remoteAddr)
+}
+
 // state of transport
 type transportState int
 
@@ -501,8 +596,9 @@ const (
 
 // ServerConfig consists of all the configurations to establish a server transport.
 type ServerConfig struct {
-	MaxStreams            uint32
-	AuthInfo              credentials.AuthInfo
+	MaxStreams uint32
+	//AuthInfo              credentials.AuthInfo
+	Creds                 credentials.TransportCredentials
 	InTapHandle           tap.ServerInHandle
 	StatsHandler          stats.Handler
 	KeepaliveParams       keepalive.ServerParameters
@@ -513,12 +609,15 @@ type ServerConfig struct {
 	ReadBufferSize        int
 	ChannelzParentID      int64
 	MaxHeaderListSize     *uint32
+	TraceCtx              func(context.Context, string) context.Context
 }
+
+type Handler func(ServerTransport, *Stream)
 
 // NewServerTransport creates a ServerTransport with conn or non-nil error
 // if it fails.
-func NewServerTransport(protocol string, conn net.Conn, config *ServerConfig) (ServerTransport, error) {
-	return newHTTP2Server(conn, config)
+func NewServerTransport(protocol string, handler Handler, config *ServerConfig) (ServerTransport, error) {
+	return newServer(handler, config)
 }
 
 // ConnectOptions covers all relevant options for communicating with the server.
@@ -619,7 +718,7 @@ type ClientTransport interface {
 
 	// Write sends the data for the given stream. A nil stream indicates
 	// the write is to be performed on the transport as a whole.
-	Write(s *Stream, hdr []byte, data []byte, opts *Options) error
+	//Write(s *Stream, hdr []byte, data []byte, opts *Options) error
 
 	// NewStream creates a Stream for an RPC.
 	NewStream(ctx context.Context, callHdr *CallHdr) (*Stream, error)
@@ -628,7 +727,7 @@ type ClientTransport interface {
 	// not needed any more. The err indicates the error incurred when
 	// CloseStream is called. Must be called when a stream is finished
 	// unless the associated transport is closing.
-	CloseStream(stream *Stream, err error)
+	//CloseStream(stream *Stream, err error)
 
 	// Error returns a channel that is closed when some I/O error
 	// happens. Typically the caller should have a goroutine to monitor
@@ -646,13 +745,13 @@ type ClientTransport interface {
 	GetGoAwayReason() GoAwayReason
 
 	// RemoteAddr returns the remote network address.
-	RemoteAddr() net.Addr
+	//RemoteAddr() net.Addr
 
 	// IncrMsgSent increments the number of message sent through this transport.
-	IncrMsgSent()
+	//IncrMsgSent()
 
 	// IncrMsgRecv increments the number of message received through this transport.
-	IncrMsgRecv()
+	//IncrMsgRecv()
 }
 
 // ServerTransport is the common interface for all gRPC server-side transport
@@ -662,19 +761,20 @@ type ClientTransport interface {
 // Write methods for a given Stream will be called serially.
 type ServerTransport interface {
 	// HandleStreams receives incoming streams using the given handler.
-	HandleStreams(func(*Stream), func(context.Context, string) context.Context)
+	//HandleStreams(func(*Stream), func(context.Context, string) context.Context)
+	Serve(net.Listener) error
 
 	// WriteHeader sends the header metadata for the given stream.
 	// WriteHeader may not be called on all streams.
-	WriteHeader(s *Stream, md metadata.MD) error
+	//WriteHeader(s *Stream, md metadata.MD) error
 
 	// Write sends the data for the given stream.
 	// Write may not be called on all streams.
-	Write(s *Stream, hdr []byte, data []byte, opts *Options) error
+	//Write(s *Stream, hdr []byte, data []byte, opts *Options) error
 
 	// WriteStatus sends the status of a stream to the client.  WriteStatus is
 	// the final call made on a stream and always occurs.
-	WriteStatus(s *Stream, st *status.Status) error
+	//WriteStatus(s *Stream, st *status.Status) error
 
 	// Close tears down the transport. Once it is called, the transport
 	// should not be accessed any more. All the pending streams and their
@@ -682,16 +782,16 @@ type ServerTransport interface {
 	Close() error
 
 	// RemoteAddr returns the remote network address.
-	RemoteAddr() net.Addr
+	//RemoteAddr(s *Stream) net.Addr
 
 	// Drain notifies the client this ServerTransport stops accepting new RPCs.
 	Drain()
 
 	// IncrMsgSent increments the number of message sent through this transport.
-	IncrMsgSent()
+	//IncrMsgSent()
 
 	// IncrMsgRecv increments the number of message received through this transport.
-	IncrMsgRecv()
+	//IncrMsgRecv()
 }
 
 // connectionErrorf creates an ConnectionError with the specified error description.

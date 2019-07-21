@@ -824,7 +824,7 @@ func (a *csAttempt) sendMsg(m interface{}, hdr, payld, data []byte) error {
 		}
 		a.mu.Unlock()
 	}
-	if err := a.t.Write(a.s, hdr, payld, &transport.Options{Last: !cs.desc.ClientStreams}); err != nil {
+	if err := a.s.Write(hdr, payld, &transport.Options{Last: !cs.desc.ClientStreams}); err != nil {
 		if !cs.desc.ClientStreams {
 			// For non-client-streaming RPCs, we return nil instead of EOF on error
 			// because the generated code requires it.  finish is not called; RecvMsg()
@@ -836,9 +836,9 @@ func (a *csAttempt) sendMsg(m interface{}, hdr, payld, data []byte) error {
 	if a.statsHandler != nil {
 		a.statsHandler.HandleRPC(cs.ctx, outPayload(true, m, data, payld, time.Now()))
 	}
-	if channelz.IsOn() {
+	/*if channelz.IsOn() {
 		a.t.IncrMsgSent()
-	}
+	}*/
 	return nil
 }
 
@@ -1158,7 +1158,7 @@ func (as *addrConnStream) SendMsg(m interface{}) (err error) {
 		return status.Errorf(codes.ResourceExhausted, "trying to send message larger than max (%d vs. %d)", len(payld), *as.callInfo.maxSendMessageSize)
 	}
 
-	if err := as.t.Write(as.s, hdr, payld, &transport.Options{Last: !as.desc.ClientStreams}); err != nil {
+	if err := as.s.Write(hdr, payld, &transport.Options{Last: !as.desc.ClientStreams}); err != nil {
 		if !as.desc.ClientStreams {
 			// For non-client-streaming RPCs, we return nil instead of EOF on error
 			// because the generated code requires it.  finish is not called; RecvMsg()
@@ -1168,9 +1168,9 @@ func (as *addrConnStream) SendMsg(m interface{}) (err error) {
 		return io.EOF
 	}
 
-	if channelz.IsOn() {
+	/*if channelz.IsOn() {
 		as.t.IncrMsgSent()
-	}
+	}*/
 	return nil
 }
 
@@ -1343,7 +1343,7 @@ func (ss *serverStream) SetHeader(md metadata.MD) error {
 }
 
 func (ss *serverStream) SendHeader(md metadata.MD) error {
-	err := ss.t.WriteHeader(ss.s, md)
+	err := ss.s.SendHeader(md)
 	if ss.binlog != nil && !ss.serverHeaderBinlogged {
 		h, _ := ss.s.Header()
 		ss.binlog.Log(&binarylog.ServerHeader{
@@ -1377,7 +1377,8 @@ func (ss *serverStream) SendMsg(m interface{}) (err error) {
 		}
 		if err != nil && err != io.EOF {
 			st, _ := status.FromError(toRPCErr(err))
-			ss.t.WriteStatus(ss.s, st)
+			//ss.t.WriteStatus(ss.s, st)
+			ss.s.WriteStatus(st)
 			// Non-user specified status was sent out. This should be an error
 			// case (as a server side Cancel maybe).
 			//
@@ -1385,9 +1386,9 @@ func (ss *serverStream) SendMsg(m interface{}) (err error) {
 			// status from the service handler, we will log that error instead.
 			// This behavior is similar to an interceptor.
 		}
-		if channelz.IsOn() && err == nil {
+		/*if channelz.IsOn() && err == nil {
 			ss.t.IncrMsgSent()
-		}
+		}*/
 	}()
 
 	// load hdr, payload, data
@@ -1400,7 +1401,7 @@ func (ss *serverStream) SendMsg(m interface{}) (err error) {
 	if len(payload) > ss.maxSendMessageSize {
 		return status.Errorf(codes.ResourceExhausted, "trying to send message larger than max (%d vs. %d)", len(payload), ss.maxSendMessageSize)
 	}
-	if err := ss.t.Write(ss.s, hdr, payload, &transport.Options{Last: false}); err != nil {
+	if err := ss.s.Write(hdr, payload, &transport.Options{Last: false}); err != nil {
 		return toRPCErr(err)
 	}
 	if ss.binlog != nil {
@@ -1437,7 +1438,7 @@ func (ss *serverStream) RecvMsg(m interface{}) (err error) {
 		}
 		if err != nil && err != io.EOF {
 			st, _ := status.FromError(toRPCErr(err))
-			ss.t.WriteStatus(ss.s, st)
+			ss.s.WriteStatus(st)
 			// Non-user specified status was sent out. This should be an error
 			// case (as a server side Cancel maybe).
 			//
@@ -1445,9 +1446,9 @@ func (ss *serverStream) RecvMsg(m interface{}) (err error) {
 			// status from the service handler, we will log that error instead.
 			// This behavior is similar to an interceptor.
 		}
-		if channelz.IsOn() && err == nil {
+		/*if channelz.IsOn() && err == nil {
 			ss.t.IncrMsgRecv()
-		}
+		}*/
 	}()
 	var payInfo *payloadInfo
 	if ss.statsHandler != nil || ss.binlog != nil {

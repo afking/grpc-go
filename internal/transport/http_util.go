@@ -259,16 +259,17 @@ func decodeMetadataHeader(k, v string) (string, error) {
 	return v, nil
 }
 
-func (d *decodeState) decodeHeader(frame *http2.MetaHeadersFrame) error {
-	// frame.Truncated is set to true when framer detects that the current header
+//func (d *decodeState) decodeHeader(frame *http2.MetaHeadersFrame) error {
+func (d *decodeState) decodeHeader(hdr http.Header) error {
+	/*// frame.Truncated is set to true when framer detects that the current header
 	// list size hits MaxHeaderListSize limit.
 	if frame.Truncated {
 		return status.Error(codes.Internal, "peer header list size exceeded limit")
-	}
+	}*/
 
-	for _, hf := range frame.Fields {
-		d.processHeaderField(hf)
-	}
+	//for _, hf := range frame.Fields {
+	d.processHeaderFields(hdr)
+	//}
 
 	if d.data.isGRPC {
 		if d.data.grpcErr != nil {
@@ -306,7 +307,6 @@ func (d *decodeState) decodeHeader(frame *http2.MetaHeadersFrame) error {
 			code = codes.Unknown
 		}
 	}
-
 	return status.Error(code, d.constructHTTPErrMsg())
 }
 
@@ -337,85 +337,94 @@ func (d *decodeState) addMetadata(k, v string) {
 	d.data.mdata[k] = append(d.data.mdata[k], v)
 }
 
-func (d *decodeState) processHeaderField(f hpack.HeaderField) {
-	switch f.Name {
-	case "content-type":
-		contentSubtype, validContentType := contentSubtype(f.Value)
-		if !validContentType {
-			d.data.contentTypeErr = fmt.Sprintf("transport: received the unexpected content-type %q", f.Value)
-			return
+//func (d *decodeState) processHeaderField(f hpack.HeaderField) {
+func (d *decodeState) processHeaderFields(hdr http.Header) {
+	for key, values := range hdr {
+		key = strings.ToLower(key) // TODO: Canonical mime encoding?
+		var value string
+		if len(values) > 0 {
+			value = values[0]
 		}
-		d.data.contentSubtype = contentSubtype
-		// TODO: do we want to propagate the whole content-type in the metadata,
-		// or come up with a way to just propagate the content-subtype if it was set?
-		// ie {"content-type": "application/grpc+proto"} or {"content-subtype": "proto"}
-		// in the metadata?
-		d.addMetadata(f.Name, f.Value)
-		d.data.isGRPC = true
-	case "grpc-encoding":
-		d.data.encoding = f.Value
-	case "grpc-status":
-		code, err := strconv.Atoi(f.Value)
-		if err != nil {
-			d.data.grpcErr = status.Errorf(codes.Internal, "transport: malformed grpc-status: %v", err)
-			return
+
+		switch key {
+		case "content-type":
+			contentSubtype, validContentType := contentSubtype(value)
+			if !validContentType {
+				d.data.contentTypeErr = fmt.Sprintf("transport: received the unexpected content-type %q", value)
+				return
+			}
+			d.data.contentSubtype = contentSubtype
+			// TODO: do we want to propagate the whole content-type in the metadata,
+			// or come up with a way to just propagate the content-subtype if it was set?
+			// ie {"content-type": "application/grpc+proto"} or {"content-subtype": "proto"}
+			// in the metadata?
+			d.addMetadata(key, value)
+			d.data.isGRPC = true
+		case "grpc-encoding":
+			d.data.encoding = value
+		case "grpc-status":
+			code, err := strconv.Atoi(value)
+			if err != nil {
+				d.data.grpcErr = status.Errorf(codes.Internal, "transport: malformed grpc-status: %v", err)
+				return
+			}
+			d.data.rawStatusCode = &code
+		case "grpc-message":
+			d.data.rawStatusMsg = decodeGrpcMessage(value)
+		case "grpc-status-details-bin":
+			v, err := decodeBinHeader(value)
+			if err != nil {
+				d.data.grpcErr = status.Errorf(codes.Internal, "transport: malformed grpc-status-details-bin: %v", err)
+				return
+			}
+			s := &spb.Status{}
+			if err := proto.Unmarshal(v, s); err != nil {
+				d.data.grpcErr = status.Errorf(codes.Internal, "transport: malformed grpc-status-details-bin: %v", err)
+				return
+			}
+			d.data.statusGen = status.FromProto(s)
+		case "grpc-timeout":
+			d.data.timeoutSet = true
+			var err error
+			if d.data.timeout, err = decodeTimeout(value); err != nil {
+				d.data.grpcErr = status.Errorf(codes.Internal, "transport: malformed time-out: %v", err)
+			}
+		/*case ":path":
+			d.data.method = value
+		case ":status":
+			code, err := strconv.Atoi(value)
+			if err != nil {
+				d.data.httpErr = status.Errorf(codes.Internal, "transport: malformed http-status: %v", err)
+				return
+			}
+			d.data.httpStatus = &code*/
+		case "grpc-tags-bin":
+			v, err := decodeBinHeader(value)
+			if err != nil {
+				d.data.grpcErr = status.Errorf(codes.Internal, "transport: malformed grpc-tags-bin: %v", err)
+				return
+			}
+			d.data.statsTags = v
+			d.addMetadata(key, string(v))
+		case "grpc-trace-bin":
+			v, err := decodeBinHeader(value)
+			if err != nil {
+				d.data.grpcErr = status.Errorf(codes.Internal, "transport: malformed grpc-trace-bin: %v", err)
+				return
+			}
+			d.data.statsTrace = v
+			d.addMetadata(key, string(v))
+		default:
+			if isReservedHeader(key) && !isWhitelistedHeader(key) {
+				break
+			}
+			v, err := decodeMetadataHeader(key, value)
+			if err != nil {
+				errorf("Failed to decode metadata header (%q, %q): %v", key, value, err)
+				return
+			}
+			d.addMetadata(key, v)
 		}
-		d.data.rawStatusCode = &code
-	case "grpc-message":
-		d.data.rawStatusMsg = decodeGrpcMessage(f.Value)
-	case "grpc-status-details-bin":
-		v, err := decodeBinHeader(f.Value)
-		if err != nil {
-			d.data.grpcErr = status.Errorf(codes.Internal, "transport: malformed grpc-status-details-bin: %v", err)
-			return
-		}
-		s := &spb.Status{}
-		if err := proto.Unmarshal(v, s); err != nil {
-			d.data.grpcErr = status.Errorf(codes.Internal, "transport: malformed grpc-status-details-bin: %v", err)
-			return
-		}
-		d.data.statusGen = status.FromProto(s)
-	case "grpc-timeout":
-		d.data.timeoutSet = true
-		var err error
-		if d.data.timeout, err = decodeTimeout(f.Value); err != nil {
-			d.data.grpcErr = status.Errorf(codes.Internal, "transport: malformed time-out: %v", err)
-		}
-	case ":path":
-		d.data.method = f.Value
-	case ":status":
-		code, err := strconv.Atoi(f.Value)
-		if err != nil {
-			d.data.httpErr = status.Errorf(codes.Internal, "transport: malformed http-status: %v", err)
-			return
-		}
-		d.data.httpStatus = &code
-	case "grpc-tags-bin":
-		v, err := decodeBinHeader(f.Value)
-		if err != nil {
-			d.data.grpcErr = status.Errorf(codes.Internal, "transport: malformed grpc-tags-bin: %v", err)
-			return
-		}
-		d.data.statsTags = v
-		d.addMetadata(f.Name, string(v))
-	case "grpc-trace-bin":
-		v, err := decodeBinHeader(f.Value)
-		if err != nil {
-			d.data.grpcErr = status.Errorf(codes.Internal, "transport: malformed grpc-trace-bin: %v", err)
-			return
-		}
-		d.data.statsTrace = v
-		d.addMetadata(f.Name, string(v))
-	default:
-		if isReservedHeader(f.Name) && !isWhitelistedHeader(f.Name) {
-			break
-		}
-		v, err := decodeMetadataHeader(f.Name, f.Value)
-		if err != nil {
-			errorf("Failed to decode metadata header (%q, %q): %v", f.Name, f.Value, err)
-			return
-		}
-		d.addMetadata(f.Name, v)
 	}
 }
 

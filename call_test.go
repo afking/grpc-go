@@ -85,21 +85,21 @@ func (h *testStreamHandler) handleStream(t *testing.T, s *transport.Stream) {
 			return
 		}
 		if v == "weird error" {
-			h.t.WriteStatus(s, status.New(codes.Internal, weirdError))
+			s.WriteStatus(status.New(codes.Internal, weirdError))
 			return
 		}
 		if v == "canceled" {
 			canceled++
-			h.t.WriteStatus(s, status.New(codes.Internal, ""))
+			s.WriteStatus(status.New(codes.Internal, ""))
 			return
 		}
 		if v == "port" {
-			h.t.WriteStatus(s, status.New(codes.Internal, h.port))
+			s.WriteStatus(status.New(codes.Internal, h.port))
 			return
 		}
 
 		if v != expectedRequest {
-			h.t.WriteStatus(s, status.New(codes.Internal, strings.Repeat("A", sizeLargeErr)))
+			s.WriteStatus(status.New(codes.Internal, strings.Repeat("A", sizeLargeErr)))
 			return
 		}
 	}
@@ -110,8 +110,8 @@ func (h *testStreamHandler) handleStream(t *testing.T, s *transport.Stream) {
 		return
 	}
 	hdr, payload := msgHeader(data, nil)
-	h.t.Write(s, hdr, payload, &transport.Options{})
-	h.t.WriteStatus(s, status.New(codes.OK, ""))
+	s.Write(hdr, payload, &transport.Options{})
+	s.WriteStatus(status.New(codes.OK, ""))
 }
 
 type server struct {
@@ -150,7 +150,29 @@ func (s *server) start(t *testing.T, port int, maxStreams uint32) {
 	s.port = p
 	s.conns = make(map[transport.ServerTransport]bool)
 	s.startedErr <- nil
-	for {
+
+	handler := func(st transport.ServerTransport, stream *transport.Stream) {
+		h := &testStreamHandler{
+			port: s.port,
+			t:    st,
+		}
+		go h.handleStream(t, stream)
+	}
+	config := &transport.ServerConfig{
+		MaxStreams: maxStreams,
+	}
+	st, err := transport.NewServerTransport("http2", handler, config)
+	if err != nil {
+		s.startedErr <- fmt.Errorf("failed to create transport: %v", err)
+		return
+	}
+	fmt.Println("LISTENING HERE")
+	/*go func() {
+		time.Sleep(time.Second * 5)
+		fmt.Println("CLOSE", st.Close())
+	}()*/
+	fmt.Println("END", st.Serve(s.lis))
+	/*for {
 		conn, err := s.lis.Accept()
 		if err != nil {
 			return
@@ -179,7 +201,7 @@ func (s *server) start(t *testing.T, port int, maxStreams uint32) {
 		}, func(ctx context.Context, method string) context.Context {
 			return ctx
 		})
-	}
+	}*/
 }
 
 func (s *server) wait(t *testing.T, timeout time.Duration) {
